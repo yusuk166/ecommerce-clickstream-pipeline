@@ -102,9 +102,10 @@ def parse_and_validate(raw: DataFrame):
     all_null = (F.col("m").isNull()
                 | (F.col("m.event_id").isNull() & F.col("m.event_type").isNull() & F.col("m.event_time").isNull()
                    & F.col("m.payload").isNull()))
+    
     reason = (F.when(all_null, "invalid_json")
                .when(F.col("event_id").isNull(), "missing_event_id")
-               .when(~F.col("event_type").isin(*EVENT_TYPES), "bad_event_type")
+               .when(~F.col("event_type").isin(EVENT_TYPES), "bad_event_type")
                .when(F.col("event_time").isNull(), "bad_event_time")
                .when(F.col("visitor_id").isNull() | F.col("item_id").isNull(), "missing_ids")
                .when((F.col("event_type") == "transaction") & F.col("transaction_id").isNull(), "transaction_without_id")
@@ -133,6 +134,8 @@ WITH ins AS (
 )
 SELECT count(*) FROM ins;
 """
+
+
 
 # 이번 배치에 등장한 1분 윈도우만 events 에서 다시 세서 덮어쓴다.
 # 배치마다 "더하기" 가 아니라 "다시 계산" 이라 같은 입력을 두 번 처리해도 값이 안 불어난다.
@@ -218,6 +221,7 @@ def make_batch_handler(args):
         t0 = time.time()
         raw = raw.cache()
         n_raw = raw.count()
+
         if n_raw == 0:
             log.info("batch=%d 새 메시지 없음", batch_id)
             raw.unpersist()

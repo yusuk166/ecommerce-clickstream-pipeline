@@ -34,9 +34,6 @@ def main() -> None:
     existing = set(admin.list_topics(timeout=10).topics)
 
     todo = [t for t in TOPICS if t.topic not in existing]
-    for t in TOPICS:
-        if t.topic in existing:
-            print(f"[skip] {t.topic} 이미 존재")
 
     if todo:
         for topic, fut in admin.create_topics(todo).items():
