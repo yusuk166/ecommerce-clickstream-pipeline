@@ -1,5 +1,3 @@
-# 장애 시나리오: 1,000건/s 로 보내는 도중 PostgreSQL 을 60초 멈췄다가 다시 켠다
-# 기대: preprocess.py 가 재시도(5s → 10s → 20s → 30s)하다가 DB 가 돌아오면 이어서 저장. 유실 · 중복 없음
 OFF=${1:-1447497}
 R=1000; N=$((R*150))
 LOG=data/metrics/failure_db.log

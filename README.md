@@ -456,10 +456,10 @@ python loadtest/report.py --drain-seconds 60
 ```
 11:00:46  생성기 시작 (1,000/s)
 11:01:16  docker compose stop postgres
-11:01:16  WARNING pg load 실패 1/6 — 5s 뒤 재시도: connection already closed
-11:01:21  WARNING pg load 실패 2/6 — 10s 뒤 재시도
-11:01:31  WARNING pg load 실패 3/6 — 20s 뒤 재시도
-11:01:51  WARNING pg load 실패 4/6 — 30s 뒤 재시도
+11:01:16  WARNING pg 실패 1/6, 5s 뒤 재시도: connection already closed
+11:01:21  WARNING pg 실패 2/6, 10s 뒤 재시도
+11:01:31  WARNING pg 실패 3/6, 20s 뒤 재시도
+11:01:51  WARNING pg 실패 4/6, 30s 뒤 재시도
 11:02:18  docker compose start postgres
 11:02:26  5번째 시도 성공 — 멈춘 동안 들고 있던 배치(9,998건) 저장. 배치 시간 76.7s, 지연 p95 81.4s
 11:02:35  밀린 77,061건을 배치 하나(8.7s)로 처리

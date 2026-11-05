@@ -1,5 +1,3 @@
-# 장애 시나리오 2: 1,000건/s 로 보내는 도중 Spark(preprocess.py)를 강제 종료했다가 다시 실행한다
-# 기대: 체크포인트에서 이어서 처리. 죽을 때 처리 중이던 배치는 처음부터 다시 → ON CONFLICT 라 중복 없음, 유실 없음
 OFF=${1:-1597497}
 R=1000; N=$((R*120))
 LOG=data/metrics/failure_spark.log

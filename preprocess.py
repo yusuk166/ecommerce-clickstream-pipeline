@@ -177,18 +177,16 @@ SELECT (SELECT count(*) FROM d1), (SELECT count(*) FROM d2), (SELECT t FROM late
 """
 
 
-# 이번 배치로 들어온 행의 end-to-end 지연 (DB 에 들어온 시각 - 생성기가 보낸 시각). 로드 테스트 지표
 LATENCY_SQL = """
 SELECT percentile_cont(0.5)  WITHIN GROUP (ORDER BY extract(epoch FROM e.ingested_at - e.produced_at)),
        percentile_cont(0.95) WITHIN GROUP (ORDER BY extract(epoch FROM e.ingested_at - e.produced_at)),
        max(extract(epoch FROM e.ingested_at - e.produced_at))
 FROM events e JOIN events_staging s USING (event_id)
-WHERE e.ingested_at = now();   -- ingested_at DEFAULT now() 는 트랜잭션 시작 시각 → 같은 트랜잭션에서 넣은 행만
+WHERE e.ingested_at = now();
 """
 
 
-def _load_once(good: DataFrame, retention_days: int) -> dict:
-    # Spark → staging (JDBC). overwrite + truncate 라 테이블 정의는 유지되고 내용만 바뀐다
+def load_once(good, retention_days):
     (good.write.format("jdbc")
          .option("url", PG_JDBC_URL)
          .option("dbtable", "events_staging")
@@ -197,44 +195,33 @@ def _load_once(good: DataFrame, retention_days: int) -> dict:
          .option("truncate", "true")
          .mode("overwrite")
          .save())
-
     with psycopg2.connect(**PG) as conn, conn.cursor() as cur:
         cur.execute("SELECT count(*) FROM events_staging")
         staged = cur.fetchone()[0]
         cur.execute(UPSERT_EVENTS)
         inserted = cur.fetchone()[0]
         cur.execute(RECOMPUTE_STATS)
-        windows_updated = cur.rowcount
         cur.execute(LATENCY_SQL)
-        lat_p50, lat_p95, lat_max = cur.fetchone()
-        # 보관 기간 밖으로 밀려난 오래된 행 삭제 (events · item_stats_1m). Parquet 은 건드리지 않는다
+        p50, p95, p_max = cur.fetchone()
         cur.execute(DELETE_OLD, {"days": retention_days})
-        deleted_events, deleted_stats, latest = cur.fetchone()
+        deleted = cur.fetchone()[0]
         conn.commit()
-    return {"staged": staged, "inserted": inserted, "skipped_existing": staged - inserted,
-            "stats_rows_upserted": windows_updated,
-            "lat_p50": lat_p50, "lat_p95": lat_p95, "lat_max": lat_max,
-            "deleted_events": deleted_events, "deleted_stats": deleted_stats, "latest_event_time": latest}
+    return {"inserted": inserted, "skipped_existing": staged - inserted, "deleted_events": deleted,
+            "lat_p50": p50, "lat_p95": p95, "lat_max": p_max}
 
 
-def load_to_postgres(good: DataFrame, retention_days: int, retries: int = 6) -> dict:
-
-    delay = 5
+def load_to_postgres(good, retention_days, retries=6):
     for attempt in range(1, retries + 1):
         try:
-            return _load_once(good, retention_days)
-        except Exception as e:  # JDBC(py4j) 와 psycopg2 모두 포함
+            return load_once(good, retention_days)
+        except Exception as e:
             if attempt == retries:
-                log.error("pg load 실패 %d/%d — 포기: %s", attempt, retries, str(e).splitlines()[0][:200])
                 raise
-            log.warning("pg load 실패 %d/%d — %ds 뒤 재시도: %s", attempt, retries, delay, str(e).splitlines()[0][:200])
+            delay = min(5 * 2 ** (attempt - 1), 30)
+            log.warning("pg 실패 %d/%d, %ds 뒤 재시도: %s", attempt, retries, delay, str(e).splitlines()[0][:120])
             time.sleep(delay)
-            delay = min(delay * 2, 30)
 
 
-# ----------------------------------------------------------------------
-# 3) micro-batch 처리 본체
-# ----------------------------------------------------------------------
 def make_batch_handler(args):
     def handle(raw: DataFrame, batch_id: int):
         t0 = time.time()
@@ -248,7 +235,6 @@ def make_batch_handler(args):
 
         good, bad = parse_and_validate(raw)
 
-        # --- DLQ: 파싱/검증 실패 → user-events-dlq 토픽으로 (원문 + 이유)
         n_bad = bad.count()
         if n_bad:
             (bad.select(F.col("kafka_key").alias("key"),
@@ -259,74 +245,46 @@ def make_batch_handler(args):
                 .option("topic", args.dlq_topic)
                 .save())
 
-        # --- 중복 제거: 같은 배치 안에 같은 event_id 가 두 번 있으면 하나만
         n_good = good.count()
         dedup = good.dropDuplicates(["event_id"]).withColumn("dt", F.to_date("event_time")).cache()
         n_dedup = dedup.count()
+        t1 = time.time()
 
-        t_spark = time.time() - t0   # 읽기 · 파싱 · 검증 · 중복 제거까지
+        dedup.write.mode("append").partitionBy("dt").parquet(args.parquet_dir)
+        t2 = time.time()
 
-        # --- Parquet: 원본 보관 (날짜 파티션, append). 재처리 입력이자 영구 보관본
-        (dedup.write.mode("append").partitionBy("dt").parquet(args.parquet_dir))
-        t_parquet = time.time() - t0 - t_spark
-
-        # --- PostgreSQL: 조회용
         pg = load_to_postgres(dedup.drop("dt"), args.pg_retention_days)
-        t_pg = time.time() - t0 - t_spark - t_parquet
+        t3 = time.time()
 
-        batch_s = time.time() - t0
-        log.info("batch=%d kafka=%d parsed_ok=%d dlq=%d dedup=%d(-%d) | pg inserted=%d skipped_existing=%d stats_upsert=%d "
-                 "| latency p50=%.1fs p95=%.1fs max=%.1fs | retention(%dd, latest=%s) deleted events=%d stats=%d | parquet=%s | %.1fs",
-                 batch_id, n_raw, n_good, n_bad, n_dedup, n_good - n_dedup,
-                 pg["inserted"], pg["skipped_existing"], pg["stats_rows_upserted"],
-                 pg["lat_p50"] or 0, pg["lat_p95"] or 0, pg["lat_max"] or 0,
-                 args.pg_retention_days, pg["latest_event_time"], pg["deleted_events"], pg["deleted_stats"],
-                 args.parquet_dir, batch_s)
-        log.info("batch=%d 구간별 시간: spark(파싱·검증·중복제거)=%.1fs parquet=%.1fs postgres=%.1fs", batch_id, t_spark, t_parquet, t_pg)
-        # 로드 테스트용 지표: 배치 1건 = 1줄 (JSON Lines)
-        append_jsonl(os.path.join(args.metrics_dir, "batches.jsonl"), {
-            "ts": time.strftime("%Y-%m-%dT%H:%M:%S"), "batch": batch_id, "kafka": n_raw, "dlq": n_bad,
-            "inserted": pg["inserted"], "batch_s": round(batch_s, 1),
-            "spark_s": round(t_spark, 1), "parquet_s": round(t_parquet, 1), "pg_s": round(t_pg, 1),
+        log.info("batch=%d in=%d dlq=%d dup=%d | pg new=%d skip=%d old_deleted=%d | p95=%.1fs | spark %.1fs parquet %.1fs pg %.1fs",
+                 batch_id, n_raw, n_bad, n_good - n_dedup, pg["inserted"], pg["skipped_existing"], pg["deleted_events"],
+                 pg["lat_p95"] or 0, t1 - t0, t2 - t1, t3 - t2)
+        append_jsonl(f"{args.metrics_dir}/batches.jsonl", {
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%S"), "batch": batch_id, "kafka": n_raw, "dlq": n_bad, "inserted": pg["inserted"],
+            "batch_s": round(t3 - t0, 1), "spark_s": round(t1 - t0, 1), "parquet_s": round(t2 - t1, 1), "pg_s": round(t3 - t2, 1),
             "lat_p50": pg["lat_p50"], "lat_p95": pg["lat_p95"], "lat_max": pg["lat_max"]})
         dedup.unpersist(); raw.unpersist()
     return handle
 
 
-def append_jsonl(path: str, row: dict) -> None:
+def append_jsonl(path, row):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "a", encoding="utf-8") as f:
         f.write(json.dumps(row, ensure_ascii=False, default=str) + "\n")
 
 
-def _offset_sum(s) -> int | None:
-    """lastProgress 의 offset {"topic": {"0": 12, "1": 34}} (dict 또는 JSON 문자열) → 전체 합"""
-    if not s:
-        return None
-    if isinstance(s, str):
-        s = json.loads(s)
-    return sum(int(v) for parts in s.values() for v in parts.values())
-
-
-def progress_logger(query, metrics_dir: str, every_s: float = 1.0) -> None:
-    """배치가 끝날 때마다 Spark 가 알려 주는 처리 현황(query.lastProgress)을 한 줄씩 남긴다.
-    입력 속도 vs 처리 속도 · 배치 처리 시간 · 밀린 양(lag = Kafka 최신 offset - 처리한 offset)"""
-    last_batch = None
+def progress_logger(query, metrics_dir):
+    seen = None
     while query.isActive:
         p = query.lastProgress
-        if p and p.get("batchId") != last_batch and p.get("numInputRows", 0) > 0:
-            last_batch = p["batchId"]
-            src = (p.get("sources") or [{}])[0]
-            end, latest = _offset_sum(src.get("endOffset")), _offset_sum(src.get("latestOffset"))
-            row = {"ts": time.strftime("%Y-%m-%dT%H:%M:%S"), "batch": last_batch,
-                   "input_rows": p.get("numInputRows"),
-                   "input_rps": round(p.get("inputRowsPerSecond") or 0, 1),
-                   "processed_rps": round(p.get("processedRowsPerSecond") or 0, 1),
-                   "batch_ms": p["durationMs"].get("triggerExecution"),
-                   "lag": (latest - end) if (end is not None and latest is not None) else None}
+        if p and p["batchId"] != seen and p["numInputRows"]:
+            seen = p["batchId"]
+            row = {"ts": time.strftime("%Y-%m-%dT%H:%M:%S"), "batch": seen, "input_rows": p["numInputRows"],
+                   "input_rps": round(p["inputRowsPerSecond"], 1), "processed_rps": round(p["processedRowsPerSecond"], 1),
+                   "batch_ms": p["durationMs"]["triggerExecution"]}
             log.info("PROGRESS %s", json.dumps(row))
-            append_jsonl(os.path.join(metrics_dir, "progress.jsonl"), row)
-        time.sleep(every_s)
+            append_jsonl(f"{metrics_dir}/progress.jsonl", row)
+        time.sleep(1)
 
 
 def main() -> None:
@@ -336,20 +294,16 @@ def main() -> None:
     ap.add_argument("--dlq-topic", default="user-events-dlq")
     ap.add_argument("--parquet-dir", default="data/parquet/events")
     ap.add_argument("--checkpoint", default="checkpoint/preprocess")
-    ap.add_argument("--pg-retention-days", type=int, default=30,
-                    help="PostgreSQL 에 남길 기간(일). 가장 최근 이벤트 시각 기준. Parquet 은 전부 보관")
-    ap.add_argument("--continuous", action="store_true", help="주기 트리거로 계속 실행 (기본: 쌓인 것만 처리하고 종료)")
-    ap.add_argument("--trigger-seconds", type=int, default=60, help="--continuous 일 때 micro-batch 간격(초). 기본 60")
-    ap.add_argument("--max-offsets-per-trigger", type=int, default=None,
-                    help="배치 하나가 읽는 최대 메시지 수. 밀린 양이 많아도 한 번에 터지지 않게 제한 (로드 테스트)")
-    ap.add_argument("--metrics-dir", default="data/metrics", help="batches.jsonl · progress.jsonl 을 쓸 폴더")
-    ap.add_argument("--starting-offsets", default="earliest", choices=["earliest", "latest"],
-                    help="체크포인트가 없을 때 어디서부터 읽나. latest = 지금부터 들어오는 것만 (로드 테스트)")
-    ap.add_argument("--reset", action="store_true", help="체크포인트를 지우고 토픽 처음부터 다시 처리")
+    ap.add_argument("--pg-retention-days", type=int, default=30)
+    ap.add_argument("--continuous", action="store_true")
+    ap.add_argument("--trigger-seconds", type=int, default=60)
+    ap.add_argument("--max-offsets-per-trigger", type=int)
+    ap.add_argument("--metrics-dir", default="data/metrics")
+    ap.add_argument("--starting-offsets", default="earliest", choices=["earliest", "latest"])
+    ap.add_argument("--reset", action="store_true")
     args = ap.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", stream=sys.stdout)
-    # Spark 워커도 드라이버와 같은 파이썬을 쓰게 (Windows 에서 python3 를 못 찾는 문제 방지)
     os.environ.setdefault("PYSPARK_PYTHON", sys.executable)
     os.environ.setdefault("PYSPARK_DRIVER_PYTHON", sys.executable)
 
@@ -360,27 +314,23 @@ def main() -> None:
     spark = build_spark("clickstream-preprocess")
     spark.sparkContext.setLogLevel("WARN")
 
-    stream = (spark.readStream.format("kafka")
+    reader = (spark.readStream.format("kafka")
               .option("kafka.bootstrap.servers", args.bootstrap)
               .option("subscribe", args.topic)
-              .option("startingOffsets", args.starting_offsets)   # 체크포인트가 있으면 그쪽이 우선
+              .option("startingOffsets", args.starting_offsets)
               .option("failOnDataLoss", "false"))
     if args.max_offsets_per_trigger:
-        stream = stream.option("maxOffsetsPerTrigger", args.max_offsets_per_trigger)
-    stream = stream.load()
+        reader = reader.option("maxOffsetsPerTrigger", args.max_offsets_per_trigger)
 
-    writer = (stream.writeStream
-              .foreachBatch(make_batch_handler(args))
-              .option("checkpointLocation", args.checkpoint))
-    if args.continuous:
-        query = writer.trigger(processingTime=f"{args.trigger_seconds} seconds").start()
-        log.info("continuous 모드: %d초마다 micro-batch. Ctrl+C 로 종료", args.trigger_seconds)
-    else:
-        query = writer.trigger(availableNow=True).start()
+    trigger = {"processingTime": f"{args.trigger_seconds} seconds"} if args.continuous else {"availableNow": True}
+    query = (reader.load().writeStream
+             .foreachBatch(make_batch_handler(args))
+             .option("checkpointLocation", args.checkpoint)
+             .trigger(**trigger)
+             .start())
+    log.info("started %s", trigger)
     threading.Thread(target=progress_logger, args=(query, args.metrics_dir), daemon=True).start()
     query.awaitTermination()
-    if not args.continuous:
-        log.info("DONE 쌓인 메시지 처리 완료")
     spark.stop()
 
 
