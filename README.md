@@ -268,7 +268,7 @@ check_partition ──▶ make_parquet ──▶ daily_agg ──▶ data_check 
 
 | 대상 | 방법 |
 |---|---|
-| Parquet `dt=…/` | 합친 파일을 `_temp/dt=…/` 에 다 쓴 뒤, 원본 폴더를 지우고 그 자리로 옮긴다 (append 아님). 행을 정렬해서 쓰므로 파일 내용도 매번 같다 |
+| Parquet `dt=…/` | 합친 파일을 `_temp/dt=…/` 에 다 쓴 뒤, 원본 폴더를 `_old/` 로 옮기고 `_temp` 를 그 자리로 옮긴 다음 `_old` 를 지운다 (append 아님). 중간에 죽으면 다음 실행의 `check_partition` 이 `_old` 를 제자리로 되돌린다. 행을 정렬해서 쓰므로 파일 내용도 매번 같다 |
 | `item_stats_daily` | 한 트랜잭션 안에서 `DELETE WHERE dt = …` + `INSERT` |
 | `daily_summary` | PK(`dt`) 로 `INSERT … ON CONFLICT DO UPDATE` |
 
@@ -381,7 +381,6 @@ publish     upstream_failed
 
 ### 6-6. 남은 문제
 
-- **교체 도중에 죽으면 그 날짜 폴더가 비어 보일 수 있다.** 원본을 지운 직후, `_temp` 를 제자리로 옮기기 전에 죽으면 합친 파일은 `_temp/dt=…/` 에 남아 있지만 `dt=…/` 는 없다. 다음 실행은 "데이터 없음" 으로 skip 하므로, 그때는 `_temp` 의 폴더를 손으로 옮겨야 한다.
 - **스트리밍과 동시에 같은 날짜를 건드리면.** `make_parquet` 가 폴더를 교체하는 사이 Spark 가 그 날짜에 파일을 쓰면 그 파일이 빠질 수 있다. 02:00 에 전날만 처리해서 확률은 낮지만, 막으려면 늦게 온 이벤트를 별도 폴더로 받거나 교체 전에 파일 목록을 다시 확인해야 한다.
 - **품질 검사가 실패해도 앞 단계 결과는 남는다.** 합친 Parquet 과 `item_stats_daily` 는 이미 바뀐 상태이고 `daily_summary` 만 안 바뀐다. 원인을 고치고 그 날짜를 다시 돌리면 덮어써진다.
 - **`target_date` 형식을 검사하지 않는다.** `"2015-6-1"` 처럼 잘못 넣으면 실패가 아니라 "데이터 없음" skip 으로 끝나서 실수를 알아채기 어렵다.
