@@ -222,7 +222,7 @@ INFO DONE 쌓인 메시지 처리 완료
 |---|---|
 | 그냥 다시 실행 (체크포인트 유지) | 새 offset 이 없어서 아무것도 처리 안 함. 저장 결과 변화 없음 |
 | `--reset` 으로 처음부터 재처리 | `pg inserted=0 skipped_existing=23000`. `events` 는 PK 로 그대로, `item_stats_1m` 은 재계산이라 내용 md5 가 전후 동일 |
-| 단, Parquet | append 라 행이 두 배 (distinct event_id 는 그대로). 아래 남은 문제 |
+| 단, Parquet | append 라 행이 두 배 (distinct event_id 는 그대로). 일 배치 `make_parquet` 가 날짜별로 지운다 (6장) |
 
 ---
 
