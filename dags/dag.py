@@ -22,6 +22,7 @@ log = logging.getLogger("airflow_log")
 
 EVENTS = Path("/opt/airflow/data/parquet/events")
 TMP = EVENTS/"_temp"
+OLD = EVENTS/"_old"
 CONN_ID = "clickstream_db"
 EVENT_SCOPE = ["view","addtocart","transaction"]
 SCHEMAS = ["event_id","event_type","event_time","visitor_id",'item_id']
@@ -84,7 +85,8 @@ def main():
             date1 = context["data_interval_start"].date().isoformat()
 
         p = p_dir(date1)
-
+        if not p.exists() and (OLD/p.name).exists():
+            (OLD/p.name).rename(p)
         if not p.exists() or not any(p.glob("*.parquet")):
             raise AirflowSkipException(f"{p} 에 데이터가 없음")
         log.info("target_date=%s files=%d", date1, len(list(p.glob("*.parquet"))))
@@ -108,8 +110,12 @@ def main():
         pq.write_table(pa.Table.from_pandas(df, schema=ARROW_SCHEMA, preserve_index=False),
                        tmp / "combined.parquet", compression="snappy")
 
-        shutil.rmtree(src,ignore_errors=True)
+        old = OLD/src.name
+        shutil.rmtree(old, ignore_errors=True)
+        OLD.mkdir(exist_ok=True)
+        src.rename(old)
         tmp.rename(src)
+        shutil.rmtree(old)
 
         result = {"parquet_cnt": parquet_cnt, "files_after": 1,
                   "rows_cnt": rows_cnt, "rows_after": len(df), "duplicates_removed": rows_cnt - len(df)}
