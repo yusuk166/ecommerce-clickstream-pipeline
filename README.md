@@ -75,7 +75,6 @@ Topic: user-events  PartitionCount: 3  ReplicationFactor: 1  Configs: retention.
 
 ## 4. Kafka 수집 
 
-
 ### 4-1. Producer (`producer.py`)
 
 ```
@@ -114,9 +113,7 @@ key = `"1149227"` (visitorid)
   }
 }
 
-
 ```
-
 
 **producer 실행 로그** 
 
@@ -131,7 +128,6 @@ INFO delivered  topic=user-events partition=1 offset=1 key=652699
 INFO delivered  topic=user-events partition=1 offset=2 key=693516
 INFO DONE sent=20000 ok=20000 fail=0 unflushed=0 elapsed=1.1s avg=17899 msg/s
 ```
-
 
 **`--rate 200` 실행** 
 
@@ -151,8 +147,6 @@ INFO DONE sent=1000 ok=1000 fail=0 unflushed=0 elapsed=5.0s avg=200 msg/s
 [p2 off=3] key=1222029  view        item=75831   event_time=2015-05-03T03:00:51.805Z
 [p2 off=4] key=990356   view        item=161722  event_time=2015-05-03T03:00:54.461Z
 ```
-
-
 
 ---
 ## 5. 전처리 · 저장
@@ -229,15 +223,6 @@ INFO DONE 쌓인 메시지 처리 완료
 | 그냥 다시 실행 (체크포인트 유지) | 새 offset 이 없어서 아무것도 처리 안 함. 저장 결과 변화 없음 |
 | `--reset` 으로 처음부터 재처리 | `pg inserted=0 skipped_existing=23000`. `events` 는 PK 로 그대로, `item_stats_1m` 은 재계산이라 내용 md5 가 전후 동일 |
 | 단, Parquet | append 라 행이 두 배 (distinct event_id 는 그대로). 아래 남은 문제 |
-
-### 5-3. 남은 문제
-
-- **Parquet 재처리 중복.** 체크포인트를 지우고 다시 돌리면 같은 이벤트가 파일로 또 쌓인다. 읽는 쪽에서 `event_id` 로 중복 제거하거나, 배치별 폴더에 쓰고 주기적으로 compaction 하는 쪽으로 정리 필요. DLQ 도 같은 이유로 재처리 때 다시 쌓인다.
-- **Parquet → PostgreSQL 되돌리기(backfill) 가 아직 없다.** 30일 밖 구간을 조회하려면 Parquet 에서 그 날짜 파티션만 읽어 `events` 에 upsert 하고 집계를 다시 계산하는 스크립트가 필요하다. `load_to_postgres` 를 그대로 재사용하면 된다.
-- **`acks=all` 이 단일 브로커에선 의미가 없다.** 복제 계수 1이라 브로커 1대가 죽으면 Kafka 에 있는 데이터는 사라진다. 로컬 실습 한계. Parquet 이 그래서 필요하다.
-- **1분 집계 재계산 비용.** 배치가 건드린 윈도우만 `events` 에서 다시 세는 방식이라 정확하지만, 한 배치에 윈도우가 많이 들어오면 그만큼 느려진다 (45일치 한 번에: 집계 upsert 887,413행 포함 62초). 로드 테스트에서 측정.
-- **아직 없는 테이블.** `item_cooccur`(함께 본 상품), `recommendations`(유저별 Top-N) 는 Airflow 일배치 몫. 스트리밍에서 30분 세션 self-join 은 상태가 커져서 배치로 뺐다.
-- **환경.** pyspark 3.5.3 은 Python 3.13 에서 워커가 죽어서 3.10 으로 실행. Windows 에서 Spark 종료 시 `snappy-java.jar 삭제 실패` 경고가 뜨는데 임시 파일 정리 문제라 결과에는 영향 없음.
 
 ---
 
@@ -378,15 +363,6 @@ publish     upstream_failed
 | `daily_summary` | 46행. 합계 view 889,821 · addtocart 22,307 · transaction 7,253 |
 
 `daily_summary` 는 PostgreSQL `events`(최근 30일) 보다 긴 46일을 다 갖고 있다. Parquet 에서 계산했기 때문.
-
-### 6-6. 남은 문제
-
-- **스트리밍과 동시에 같은 날짜를 건드리면.** `make_parquet` 가 폴더를 교체하는 사이 Spark 가 그 날짜에 파일을 쓰면 그 파일이 빠질 수 있다. 02:00 에 전날만 처리해서 확률은 낮지만, 막으려면 늦게 온 이벤트를 별도 폴더로 받거나 교체 전에 파일 목록을 다시 확인해야 한다.
-- **품질 검사가 실패해도 앞 단계 결과는 남는다.** 합친 Parquet 과 `item_stats_daily` 는 이미 바뀐 상태이고 `daily_summary` 만 안 바뀐다. 원인을 고치고 그 날짜를 다시 돌리면 덮어써진다.
-- **`target_date` 형식을 검사하지 않는다.** `"2015-6-1"` 처럼 잘못 넣으면 실패가 아니라 "데이터 없음" skip 으로 끝나서 실수를 알아채기 어렵다.
-- **알림은 웹훅을 넣어야 실제로 간다.** 지금은 `DISCORD_WEBHOOK_URL` 이 비어 있어 `ALERT` 로그로만 확인했다.
-- **추천용 테이블은 아직 없다.** `item_cooccur`(함께 본 상품), `recommendations`(유저별 Top-N) 는 이 DAG 에 `daily_agg` 다음 Task 로 붙이면 된다.
-- **pandas 로 하루치를 메모리에서 처리한다.** 하루 2~3만 건이라 1초 안에 끝나지만, 데이터가 커지면 Spark 작업(`SparkSubmitOperator`)으로 바꿔야 한다.
 
 ---
 
