@@ -249,17 +249,17 @@ INFO DONE 쌓인 메시지 처리 완료
 ### 6-1. DAG 구조
 
 ```
-check_partition ──▶ compact_parquet ──▶ daily_agg ──▶ quality_check ──▶ publish
-   (날짜 확인)        (파일 합치기·중복 제거)  (하루 상품 집계)   (건수·null·중복)     (대시보드 갱신)
-                                   └──── 어느 Task 든 최종 실패하면 → 알림 (on_failure_callback) ────┘
+check_partition ──▶ make_parquet ──▶ daily_agg ──▶ data_check ──▶ publish
+   (날짜 확인)      (파일 합치기·중복 제거)  (하루 상품 집계)  (건수·null·중복)   (대시보드 갱신)
+                          └──── 어느 Task 든 최종 실패하면 → 알림 (on_failure_callback) ────┘
 ```
 
 | Task | 하는 일 (한 줄) | 입력 → 출력 | 재시도 |
 |---|---|---|---|
 | `check_partition` | 처리할 날짜를 정하고 그 날짜 Parquet 폴더가 있는지 확인. 없으면 이후 Task 를 건너뜀(skip) | `dt=YYYY-MM-DD/` 존재 여부 | 0 |
-| `compact_parquet` | 그 날짜의 작은 파일들을 하나로 합치고 `event_id` 중복을 지운 뒤 폴더를 통째로 교체 | Parquet 여러 개 → Parquet 1개 | 3 |
+| `make_parquet` | 그 날짜의 작은 파일들을 하나로 합치고 `event_id` 중복을 지운 뒤 폴더를 통째로 교체 | Parquet 여러 개 → `combined.parquet` 1개 | 3 |
 | `daily_agg` | 하루 × 상품별 view · addtocart · transaction · 고유 방문자 수를 다시 계산 | Parquet → PostgreSQL `item_stats_daily` | 3 |
-| `quality_check` | 건수 > 0, 필수 컬럼 null 0, `event_id` 중복 0, 이벤트 종류 · 날짜 범위, 집계 합계 = 원본 건수 | Parquet + `item_stats_daily` → 통과 / 실패 | 0 |
+| `data_check` | 건수 > 0, 필수 컬럼 null 0, `event_id` 중복 0, 이벤트 종류 · 날짜 범위, 집계 합계 = 원본 건수 | Parquet + `item_stats_daily` → 통과 / 실패 | 0 |
 | `publish` | 검사를 통과한 날짜만 하루 요약 1행을 업서트 | Parquet → PostgreSQL `daily_summary` | 3 |
 
 `daily_agg` 를 PostgreSQL `events` 가 아니라 Parquet 에서 계산하는 이유: `events` 는 최근 30일만 남기 때문. Parquet 은 전체 이력이라 오래된 날짜도 같은 코드로 다시 계산할 수 있다.
@@ -268,23 +268,24 @@ check_partition ──▶ compact_parquet ──▶ daily_agg ──▶ quality_
 
 | 대상 | 방법 |
 |---|---|
-| Parquet `dt=…/` | 새 파일을 `_compact_tmp/` 에 다 쓴 뒤 폴더째 교체 (append 아님). 행을 정렬해서 쓰므로 파일 내용도 매번 같다 |
+| Parquet `dt=…/` | 합친 파일을 `_temp/dt=…/` 에 다 쓴 뒤, 원본 폴더를 지우고 그 자리로 옮긴다 (append 아님). 행을 정렬해서 쓰므로 파일 내용도 매번 같다 |
 | `item_stats_daily` | 한 트랜잭션 안에서 `DELETE WHERE dt = …` + `INSERT` |
 | `daily_summary` | PK(`dt`) 로 `INSERT … ON CONFLICT DO UPDATE` |
 
-`compact_parquet` 가 5-3 의 "Parquet 재처리 중복" 을 날짜 단위로 해결한다. 스트리밍을 처음부터 다시 돌려 같은 이벤트가 또 쌓여도, 그 날짜 DAG 가 돌면 중복이 사라진다.
+`_temp` 처럼 `_` 로 시작하는 폴더는 Spark · pyarrow 가 읽지 않으므로 작업 중인 파일이 데이터에 섞이지 않는다.
+`make_parquet` 가 5-3 의 "Parquet 재처리 중복" 을 날짜 단위로 해결한다. 스트리밍을 처음부터 다시 돌려 같은 이벤트가 또 쌓여도, 그 날짜 DAG 가 돌면 중복이 사라진다.
 
 ### 6-2. retry · backoff 전략
 
-기본값: `retries=3`, `retry_delay=1분`, `retry_exponential_backoff=True`, `max_retry_delay=10분` → 대략 1분 → 2분 → 4분 (Airflow 가 약간의 랜덤을 섞는다).
+기본값: `retries=3`, `retry_delay=1분`, `retry_exponential_backoff=True` → 재시도 전 대기 시간이 1~2분 → 2~4분 → 4~8분으로 늘어난다 (Airflow 가 범위 안에서 랜덤으로 고른다).
 
 | 구분 | Task | 이유 |
 |---|---|---|
-| 재시도한다 | `compact_parquet`, `daily_agg`, `publish` | 파일 잠금, DB 연결 끊김, 잠깐의 부하처럼 기다리면 풀리는 실패가 대부분 |
-| 재시도 없이 바로 알림 | `quality_check` | 데이터가 틀린 것은 다시 돌려도 똑같이 틀린다. `AirflowFailException` 으로 즉시 실패 |
-| 재시도 없음 | `check_partition` | 폴더가 없으면 실패가 아니라 "처리할 것 없음" → skip. 날짜 형식이 틀리면 바로 실패 |
+| 재시도한다 | `make_parquet`, `daily_agg`, `publish` | 파일 잠금, DB 연결 끊김, 잠깐의 부하처럼 기다리면 풀리는 실패가 대부분. 간격을 늘려 복구 중인 DB 를 계속 두드리지 않는다 |
+| 재시도 없이 바로 알림 | `data_check` | 데이터가 틀린 것은 다시 돌려도 똑같이 틀린다. `AirflowFailException` 으로 즉시 실패 |
+| 재시도 없음 | `check_partition` | 폴더가 없으면 실패가 아니라 "처리할 것 없음" → skip |
 
-알림: 재시도를 다 쓰고 최종 실패하면 `on_failure_callback` 이 실행된다. `DISCORD_WEBHOOK_URL` 환경 변수가 있으면 Discord 로 보내고, 없으면 `ALERT` 로그만 남긴다.
+알림: 재시도를 다 쓰고 최종 실패하면 `on_failure_callback`(`notify_fail`) 이 실행된다. `DISCORD_WEBHOOK_URL` 환경 변수가 있으면 Discord 로 보내고, 없으면 `ALERT` 로그만 남긴다.
 
 ### 6-3. 스케줄 · 의존성
 
@@ -302,9 +303,9 @@ check_partition ──▶ compact_parquet ──▶ daily_agg ──▶ quality_
 **순서의 이유**
 
 1. `check_partition` 이 맨 앞 — 데이터가 없는 날에 뒤 Task 들이 빈 결과를 쓰지 않도록
-2. `compact_parquet` → `daily_agg` — 중복을 지운 파일로 집계해야 숫자가 맞다
-3. `daily_agg` → `quality_check` — 원본과 집계 결과를 둘 다 만든 뒤에 "합계가 같은가" 를 볼 수 있다
-4. `quality_check` → `publish` — 검사에 실패한 날짜는 대시보드에 올라가지 않는다
+2. `make_parquet` → `daily_agg` — 중복을 지운 파일로 집계해야 숫자가 맞다
+3. `daily_agg` → `data_check` — 원본과 집계 결과를 둘 다 만든 뒤에 "합계가 같은가" 를 볼 수 있다
+4. `data_check` → `publish` — 검사에 실패한 날짜는 대시보드에 올라가지 않는다
 
 ### 6-4. 실행 방법
 
@@ -330,46 +331,48 @@ docker exec postgres psql -U clickstream -d clickstream -c "select * from daily_
 | DAG | `dags/dag.py` |
 | Airflow 설정 | `docker-compose.airflow.yml` (메타 DB 는 별도 `airflow-db` 컨테이너) |
 | 입력 | `data/parquet/events/dt=YYYY-MM-DD/` (컨테이너 안 `/opt/airflow/data/parquet/events`) |
-| 출력 | Parquet 같은 폴더 (합친 파일 1개로 교체), PostgreSQL `item_stats_daily`, `daily_summary` |
+| 출력 | Parquet 같은 폴더 (`combined.parquet` 1개로 교체), PostgreSQL `item_stats_daily`, `daily_summary` |
 
 ### 6-5. 실행 결과
 
 **같은 날짜(2015-06-10)를 두 번 실행 → 결과 동일**
 
 ```
-              Parquet 파일          item_stats_daily                          daily_summary
-1차 실행      1개 md5 63ea045f8285   13,985행 합계 24,020 md5 851b57b02c1c     24020 view 23213 cart 597 tx 210 방문자 13995
-2차 실행      1개 md5 63ea045f8285   13,985행 합계 24,020 md5 851b57b02c1c     (동일)
+              Parquet 파일                 item_stats_daily                          daily_summary
+1차 실행      combined.parquet md5 63ea045f8285   13,985행 합계 24,020 md5 851b57b02c1c     24020 view 23213 cart 597 tx 210 방문자 13995
+2차 실행      combined.parquet md5 63ea045f8285   13,985행 합계 24,020 md5 851b57b02c1c     (동일)
 ```
 
-1차 실행 로그: `compact files 8 → 1, rows 24020 → 24020` · `daily_agg items=13985` · `quality 전부 0, agg_total=24020`.
+로그: `daily_agg items=13985 events=24020` · `quality 전부 0, agg_total=24020`.
 
 **스트리밍 재처리로 중복이 쌓인 상황을 만들고 다시 실행 → 결과 동일**
 
 Spark 가 쓴 원본 파일 하나를 같은 폴더에 다시 넣어 같은 이벤트 2,984건을 중복시킨 뒤 실행:
-`compact files 2 → 1, rows 27004 → 24020, duplicates_removed=2984`. 파일 md5 · 집계 md5 · 요약 모두 1차와 같다.
+`compact {'parquet_cnt': 2, 'files_after': 1, 'rows_cnt': 27004, 'rows_after': 24020, 'duplicates_removed': 2984}`. 파일 md5 · 집계 md5 · 요약 모두 1차와 같다.
 
 **품질 검사 실패 → 재시도 없이 바로 알림, 대시보드에는 안 올라감**
 
 2015-06-11 폴더에 `event_type="purchase"` 인 행 1개를 넣고 실행:
 
 ```
-quality_check  FAILED  try=1  (Immediate failure requested)
-ALERT `daily_events.quality_check` 실패 (target_date=2015-06-11, try=1)
+data_check  FAILED  try=1  (Immediate failure requested)
+ALERT `daily_events.data_check` 실패 (target_date=2015-06-11, try=1)
       — 품질 검사 실패: ['bad_event_type', 'agg_total != row_count'] {'row_count': 20908, 'bad_event_type': 1, 'agg_total': 20907, ...}
       (이상한 종류 1건은 집계에서 빠지므로 합계가 원본보다 1 적다 → 두 검사 모두에 걸림)
-publish        upstream_failed
+publish     upstream_failed
 ```
 
-같은 실행에서 `compact_parquet` 는 처음 두 번 실패(테스트 파일을 다른 pyarrow 버전으로 만들어 읽기 오류) → 1분 19초 뒤, 4분 뒤 재시도 → 세 번째에 성공. 재시도 간격이 늘어나는 것도 확인됐다.
+테스트 후 원본 폴더로 되돌리고 다시 실행 → success, `daily_summary` 2015-06-11 = 20,907건.
 
-**스케줄 실행 (데이터 없는 날)**: 켜자마자 생긴 `scheduled__2026-10-30` 실행은 `dt=2026-10-30` 폴더가 없어서 `check_partition` 이 skip → 나머지도 skip, 실행 상태는 success.
+**재시도 간격**: 파일 합치기 Task 가 읽기 오류(테스트 파일을 다른 pyarrow 버전으로 만듦)로 두 번 실패했을 때 1분 19초 뒤, 약 4분 뒤 재시도 → 세 번째에 성공. 대기 시간이 늘어나는 것을 확인했다.
 
-**전체 기간 backfill (2015-05-03 ~ 06-17, 46일)**: 46회 × 5 Task 전부 success, 실행 1회당 약 5초 (총 약 4분).
+**스케줄 실행 (데이터 없는 날)**: `scheduled__2026-10-31` 실행은 `dt=2026-10-31` 폴더가 없어서 `check_partition` 이 skip → 나머지도 skip, 실행 상태는 success.
+
+**전체 기간 backfill (2015-05-03 ~ 06-17, 46일)**: 46회 × 5 Task = 230개 전부 success, 총 약 2분 30초.
 
 | 확인 | 결과 |
 |---|---|
-| Parquet | 46개 폴더, 파일 738개 → 46개 (날짜당 1개), 54MB → 50MB, 919,381행 = distinct `event_id` 919,381 |
+| Parquet | 46개 폴더에 `combined.parquet` 하나씩 (처음 합칠 때 Spark 파일 738개 → 46개), 54MB → 50MB, 919,381행 = distinct `event_id` 919,381 |
 | Spark 로 다시 읽기 | `spark.read.parquet` 919,381행, `dt` 와 `event_time` 날짜가 다른 행 0. 합친 파일과 Spark 파일이 섞여도 읽힌다 |
 | `item_stats_daily` | 553,646행, 46일, 합계 919,381 (= Parquet 전체 건수) |
 | `daily_summary` | 46행. 합계 view 889,821 · addtocart 22,307 · transaction 7,253 |
@@ -378,8 +381,109 @@ publish        upstream_failed
 
 ### 6-6. 남은 문제
 
-- **스트리밍과 동시에 같은 날짜를 건드리면.** `compact_parquet` 가 폴더를 교체하는 사이 Spark 가 그 날짜에 파일을 쓰면 그 파일이 빠질 수 있다. 02:00 에 전날만 처리해서 확률은 낮지만, 막으려면 늦게 온 이벤트를 별도 폴더로 받거나 교체 전에 파일 목록을 다시 확인해야 한다.
+- **교체 도중에 죽으면 그 날짜 폴더가 비어 보일 수 있다.** 원본을 지운 직후, `_temp` 를 제자리로 옮기기 전에 죽으면 합친 파일은 `_temp/dt=…/` 에 남아 있지만 `dt=…/` 는 없다. 다음 실행은 "데이터 없음" 으로 skip 하므로, 그때는 `_temp` 의 폴더를 손으로 옮겨야 한다.
+- **스트리밍과 동시에 같은 날짜를 건드리면.** `make_parquet` 가 폴더를 교체하는 사이 Spark 가 그 날짜에 파일을 쓰면 그 파일이 빠질 수 있다. 02:00 에 전날만 처리해서 확률은 낮지만, 막으려면 늦게 온 이벤트를 별도 폴더로 받거나 교체 전에 파일 목록을 다시 확인해야 한다.
 - **품질 검사가 실패해도 앞 단계 결과는 남는다.** 합친 Parquet 과 `item_stats_daily` 는 이미 바뀐 상태이고 `daily_summary` 만 안 바뀐다. 원인을 고치고 그 날짜를 다시 돌리면 덮어써진다.
+- **`target_date` 형식을 검사하지 않는다.** `"2015-6-1"` 처럼 잘못 넣으면 실패가 아니라 "데이터 없음" skip 으로 끝나서 실수를 알아채기 어렵다.
 - **알림은 웹훅을 넣어야 실제로 간다.** 지금은 `DISCORD_WEBHOOK_URL` 이 비어 있어 `ALERT` 로그로만 확인했다.
 - **추천용 테이블은 아직 없다.** `item_cooccur`(함께 본 상품), `recommendations`(유저별 Top-N) 는 이 DAG 에 `daily_agg` 다음 Task 로 붙이면 된다.
 - **pandas 로 하루치를 메모리에서 처리한다.** 하루 2~3만 건이라 1초 안에 끝나지만, 데이터가 커지면 Spark 작업(`SparkSubmitOperator`)으로 바꿔야 한다.
+
+---
+
+## 7. 로드 테스트 · 장애 대응
+
+스트리밍 구간(`producer.py` → Kafka → `preprocess.py` → Parquet · PostgreSQL)에 속도를 단계별로 올려 어디서 막히는지 재고, 장애를 일부러 내서 어떻게 복구되는지 확인했다.
+
+### 7-1. 측정 방법
+
+| 지표 | 뜻 | 어디서 |
+|---|---|---|
+| 입력 속도 vs 처리 속도 | 초당 들어오는 건수 vs 처리하는 건수 | `query.lastProgress` 의 `inputRowsPerSecond` · `processedRowsPerSecond` |
+| 배치 처리 시간 | micro-batch 한 번에 걸리는 시간 | `lastProgress` 의 `durationMs.triggerExecution` |
+| 밀린 양 (lag) | 생성기가 보낸 건수 − 처리한 건수 (배치가 끝난 시점) | 생성기 고정 속도 × 경과 시간 − 처리 누적 (`loadtest/report.py`) |
+| end-to-end 지연 | DB 에 들어온 시각 − 생성기가 보낸 시각 (`ingested_at − produced_at`) 의 p50 · p95 | 배치마다 SQL 로 계산 (`preprocess.py` `LATENCY_SQL`) |
+| 구간별 시간 | Spark(파싱·검증·중복 제거) / Parquet / PostgreSQL 저장에 각각 걸린 시간 | 배치 핸들러에서 `time.time()` 으로 나눠 측정 |
+
+`preprocess.py` 가 배치마다 `data/metrics/progress.jsonl`(Spark 진행 현황) · `batches.jsonl`(건수 · 지연 · 구간별 시간) 에 한 줄씩 남기고, `loadtest/report.py` 가 단계별 표로 묶는다.
+lag 를 Spark 의 `latestOffset − endOffset` 으로 쓰지 않은 이유: 입력량 제한(`maxOffsetsPerTrigger`)이 없으면 배치를 계획할 때 쌓인 걸 전부 읽으므로 둘이 항상 같아 0 으로 나온다.
+
+```bash
+# 1) 10초 트리거로 계속 처리. 지금부터 들어오는 것만 (체크포인트 · Parquet 은 로드 테스트용으로 분리)
+python preprocess.py --continuous --trigger-seconds 10 --checkpoint checkpoint/loadtest \
+                     --starting-offsets latest --parquet-dir data/parquet/loadtest
+# 2) 단계 증가: 100 → 300 → 1,000 → 3,000 건/s, 각 2분 (CSV 919,497행째부터 — 이미 저장된 행과 겹치지 않게)
+bash loadtest/run_steps.sh 919497 100 300 1000 3000
+# 3) 장애 시나리오
+bash loadtest/run_failure_db.sh 2400000      # 1,000/s 전송 중 postgres 60초 정지 → 재시작
+bash loadtest/run_failure_spark.sh 2550000   # 1,000/s 전송 중 preprocess.py 강제 종료 → 15초 뒤 재시작
+# 4) 결과 표
+python loadtest/report.py --drain-seconds 60
+```
+
+### 7-2. 부하 시나리오 — 단계 증가 (step)
+
+생성기 `--rate` 로 초당 건수를 고정하고 단계마다 2분씩 유지했다 (Spark 트리거 10초). 3,000/s 까지 여유가 있어 6,000 · 10,000 · 20,000 까지 올렸다.
+
+| 입력 속도 (목표 / 실측, 건/s) | 처리 속도 (건/s) | 배치 처리 시간 평균 / 최대 | 지연 p95 평균 / 최대 | lag 최대 | lag 추세 | 판단 |
+|---|---|---|---|---|---|---|
+| 100 / 96 | 608 | 1.9s / 5.5s | 10.7s / 12.3s | 734 | 일정 | 여유 |
+| 300 / 287 | 1,470 | 2.0s / 2.2s | 10.5s / 10.6s | 1,330 | 일정 | 여유 |
+| 1,000 / 862 | 1,508 | 6.4s / 7.0s | 10.8s / 10.9s | 7,879 | 일정 | 여유 |
+| 3,000 / 3,083 | 7,377 | 4.1s / 9.0s | 11.6s / 11.8s | 16,804 | 일정 | 여유 |
+| 6,000 / 5,567 | 10,033 | 6.0s / 11.1s | 12.2s / 14.7s | 76,416 | 일정 | 여유 |
+| 10,000 / 10,410 | 12,463 | 7.2s / 7.9s | 14.3s / 15.1s | 64,966 | 일정 | 여유 (배치 7.8s < 트리거 10s) |
+| 20,000 / 11,168 | 9,614 | 40.5s / 63.0s | 44.3s / 75.9s | 1,048,636 | 계속 증가 | **한계** |
+
+- 지연 p95 가 낮은 속도에서도 ~10.7초인 이유: 트리거 간격이 10초라 메시지가 평균 5초, 최대 10초를 Kafka 에서 기다린 뒤 처리된다. 지연의 바닥 = 트리거 간격.
+- 10,000/s 까지는 배치가 트리거 간격 안에 끝나 lag 가 쌓이지 않는다. 20,000/s 에서 배치가 40 → 55 → 63초로 늘어나며 lag 가 100만 건까지 쌓였다 (실측 입력 11,168/s 는 그 단계에서 실제로 처리된 평균 속도). 생성기를 멈춘 뒤 밀린 100만 건을 63초 배치 하나로 따라잡았다.
+- **처리 상한은 약 12,000 ~ 14,000 건/s.** 1,000/s 단계의 배치가 3,000/s 보다 느린 것은 그 구간에서 보관 기간 밖 행 삭제(`DELETE_OLD`)가 많이 돌아서다 — 삭제가 같은 트랜잭션에 있어 배치 시간에 포함된다.
+
+**어디가 먼저 막혔나** — 10,000/s 로 600,000건을 보내며 구간별 시간을 재면 Spark(파싱 · 검증 · 중복 제거) 46%, PostgreSQL 저장 47%, Parquet 6% 다. PostgreSQL 구간은 배치마다 staging 통째로 쓰기 → 업서트 → 1분 집계 재계산 → 보관 기간 삭제를 한 트랜잭션에서 하므로 건수가 적어도 2.4초 이상 걸리는 고정 비용이 있고, 건수가 늘면 Spark 쪽과 같이 늘어난다. **한 줄: PostgreSQL 저장(집계 재계산 포함)과 Spark 파싱이 반반으로 상한을 만들고, 그 상한(~13,000/s)을 넘는 20,000/s 에서 lag 가 쌓인다.**
+
+### 7-3. 장애 시나리오와 대응 (fallback · alert)
+
+| 장애 | 대응 방법 | 코드 |
+|---|---|---|
+| DB 가 잠깐 멈춤 | 저장 실패 시 5s → 10s → 20s → 30s 간격으로 최대 6번 재시도. staging 은 매번 통째로 다시 쓰고 `events` 는 `ON CONFLICT` 라 몇 번 다시 해도 결과가 같다 | `preprocess.py` `load_to_postgres` |
+| Spark 가 죽음 | 체크포인트에서 이어서 처리. 죽을 때 처리 중이던 배치는 처음부터 다시 → `ON CONFLICT` 로 중복 없음 | `checkpointLocation` |
+| 깨진 메시지 | 정상 처리는 계속하고, 깨진 건만 이유를 붙여 DLQ 토픽으로 (5장) | `parse_and_validate` |
+| 입력 폭증 | `--max-offsets-per-trigger` 로 배치 하나의 크기를 제한해 한 번에 터지지 않게 | `preprocess.py` 옵션 |
+| 알림 | 재시도마다 `WARNING`, 재시도를 다 쓰면 `ERROR` 로그 후 종료. 일 배치(Airflow)는 `on_failure_callback` → Discord 웹훅 (6장) | `log.warning` / `notify_fail` |
+
+**시나리오 1 — PostgreSQL 60초 정지** (1,000/s 로 150,000건 전송 중)
+
+```
+11:00:46  생성기 시작 (1,000/s)
+11:01:16  docker compose stop postgres
+11:01:16  WARNING pg load 실패 1/6 — 5s 뒤 재시도: connection already closed
+11:01:21  WARNING pg load 실패 2/6 — 10s 뒤 재시도
+11:01:31  WARNING pg load 실패 3/6 — 20s 뒤 재시도
+11:01:51  WARNING pg load 실패 4/6 — 30s 뒤 재시도
+11:02:18  docker compose start postgres
+11:02:26  5번째 시도 성공 — 멈춘 동안 들고 있던 배치(9,998건) 저장. 배치 시간 76.7s, 지연 p95 81.4s
+11:02:35  밀린 77,061건을 배치 하나(8.7s)로 처리
+11:02:42  지연 p95 10.5s 로 복귀  → 회복 시간: DB 복구 후 약 25초
+```
+
+결과: 보낸 150,000건 중 CSV 자체 중복(같은 행) 30건을 뺀 **149,970건이 전부 PostgreSQL 에 있음** (`inserted` 합 149,970 = `events` 행 수 149,970). 유실 0, 중복 0.
+
+**시나리오 2 — Spark 강제 종료 → 15초 뒤 재시작** (1,000/s 로 120,000건 전송 중)
+
+```
+11:04:43  preprocess.py 강제 종료 (taskkill)
+11:04:58  재시작 → 11:05:07 체크포인트에서 이어서 시작
+11:05:19  첫 배치 (9,998건)  지연 p95 43.5s
+11:05:24  밀린 39,501건을 배치 하나(4.5s)로 처리
+11:05:27  지연 p95 6.0s 로 복귀  → 회복 시간: 재시작 후 약 20초
+```
+
+결과: 120,000건 중 CSV 중복 13건을 뺀 **119,987건 전부 저장**, 유실 0, 중복 0.
+
+### 7-4. 남은 문제
+
+- **단계 유지 시간이 2분.** 강의 기준(3~5분)보다 짧다. 장시간 유지(soak, 한계의 70% 로 30분 이상)는 하지 않았다 — 메모리 · 지연이 서서히 느는지는 미확인.
+- **알림이 로그뿐.** 스트리밍 쪽은 Discord 웹훅이 없어서 재시도 · 최종 실패가 로그에만 남는다. lag 나 p95 가 기준을 넘을 때 보내는 알림도 없다.
+- **보관 기간 삭제가 배치 시간에 포함.** 매 배치 `DELETE_OLD` 가 같은 트랜잭션에서 돌아, 오래된 행이 많이 밀려나는 구간에서 배치가 느려진다. 일 배치(Airflow)로 빼면 스트리밍 배치가 가벼워진다.
+- **1분 집계 재계산 비용.** 배치가 건드린 윈도우를 `events` 에서 다시 세는 방식이라 배치가 클수록 비례해 느려진다. 병목을 줄이려면 집계를 일 배치로 옮기거나 윈도우별 증분 계산으로 바꿔야 한다.
+- **병목 고친 뒤 재측정(보너스)은 안 했다.**

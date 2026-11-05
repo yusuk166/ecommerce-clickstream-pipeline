@@ -208,7 +208,9 @@ def main():
     agg = daily_agg(d)
     checked = data_check(d)
     published = publish(d)
+
     compacted >> agg >> checked >> published
+    #check_partition -> make_parquet -> daily_agg -> data_check -> publish
 
 main()
 

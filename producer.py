@@ -40,7 +40,7 @@ def delivery_report(err: KafkaError | None, msg: Message) -> None:
         stats["fail"] += 1
         log.error("delivery failed key=%s err=%s", msg.key(), err)
         if failed_log:
-
+            failed_log.write(json.dumps({"key": msg.key().decode(), "value": msg.value().decode(), "error": str(err)}) + "\n")
     else:
         stats["ok"] += 1
         if stats["ok"] <= 3:  # 처음 몇 건은 어디에 들어갔는지 보여준다
