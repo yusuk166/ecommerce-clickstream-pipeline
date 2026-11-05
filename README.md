@@ -368,89 +368,66 @@ publish     upstream_failed
 
 ## 7. 로드 테스트 · 장애 대응
 
-스트리밍 구간(`producer.py` → Kafka → `preprocess.py` → Parquet · PostgreSQL)에 속도를 단계별로 올려 어디서 막히는지 재고, 장애를 일부러 내서 어떻게 복구되는지 확인했다.
+### 7-1. 측정
 
-### 7-1. 측정 방법
-
-| 지표 | 뜻 | 어디서 |
+| 지표 | 계산 | 코드 |
 |---|---|---|
-| 입력 속도 vs 처리 속도 | 초당 들어오는 건수 vs 처리하는 건수 | `query.lastProgress` 의 `inputRowsPerSecond` · `processedRowsPerSecond` |
-| 배치 처리 시간 | micro-batch 한 번에 걸리는 시간 | `lastProgress` 의 `durationMs.triggerExecution` |
-| 밀린 양 (lag) | 생성기가 보낸 건수 − 처리한 건수 (배치가 끝난 시점) | 생성기 고정 속도 × 경과 시간 − 처리 누적 (`loadtest/report.py`) |
-| end-to-end 지연 | DB 에 들어온 시각 − 생성기가 보낸 시각 (`ingested_at − produced_at`) 의 p50 · p95 | 배치마다 SQL 로 계산 (`preprocess.py` `LATENCY_SQL`) |
-| 구간별 시간 | Spark(파싱·검증·중복 제거) / Parquet / PostgreSQL 저장에 각각 걸린 시간 | 배치 핸들러에서 `time.time()` 으로 나눠 측정 |
-
-`preprocess.py` 가 배치마다 `data/metrics/progress.jsonl`(Spark 진행 현황) · `batches.jsonl`(건수 · 지연 · 구간별 시간) 에 한 줄씩 남기고, `loadtest/report.py` 가 단계별 표로 묶는다.
-lag 를 Spark 의 `latestOffset − endOffset` 으로 쓰지 않은 이유: 입력량 제한(`maxOffsetsPerTrigger`)이 없으면 배치를 계획할 때 쌓인 걸 전부 읽으므로 둘이 항상 같아 0 으로 나온다.
+| 입력 · 처리 속도, 배치 시간 | Spark `query.lastProgress` | `preprocess.py` `progress_logger` |
+| lag | 보낸 건수 − 처리한 건수 | `loadtest/report.py` |
+| 지연 p95 | DB 저장 시각 − 보낸 시각 | `preprocess.py` `LATENCY_SQL` |
+| 구간별 시간 | Spark / Parquet / PostgreSQL 각각 | `preprocess.py` 배치 핸들러 |
 
 ```bash
-# 1) 10초 트리거로 계속 처리. 지금부터 들어오는 것만 (체크포인트 · Parquet 은 로드 테스트용으로 분리)
-python preprocess.py --continuous --trigger-seconds 10 --checkpoint checkpoint/loadtest \
-                     --starting-offsets latest --parquet-dir data/parquet/loadtest
-# 2) 단계 증가: 100 → 300 → 1,000 → 3,000 건/s, 각 2분 (CSV 919,497행째부터 — 이미 저장된 행과 겹치지 않게)
+python preprocess.py --continuous --trigger-seconds 10 --checkpoint checkpoint/loadtest --starting-offsets latest --parquet-dir data/parquet/loadtest
 bash loadtest/run_steps.sh 919497 100 300 1000 3000
-# 3) 장애 시나리오
-bash loadtest/run_failure_db.sh 2400000      # 1,000/s 전송 중 postgres 60초 정지 → 재시작
-bash loadtest/run_failure_spark.sh 2550000   # 1,000/s 전송 중 preprocess.py 강제 종료 → 15초 뒤 재시작
-# 4) 결과 표
+bash loadtest/run_failure_db.sh 2400000
+bash loadtest/run_failure_spark.sh 2550000
 python loadtest/report.py --drain-seconds 60
 ```
 
-### 7-2. 부하 시나리오 — 단계 증가 (step)
+### 7-2. 부하 (단계 증가, 각 2분, 트리거 10초)
 
-생성기 `--rate` 로 초당 건수를 고정하고 단계마다 2분씩 유지했다 (Spark 트리거 10초). 3,000/s 까지 여유가 있어 6,000 · 10,000 · 20,000 까지 올렸다.
+| 입력 (건/s) | 처리 (건/s) | 배치 시간 평균 / 최대 | 지연 p95 | lag 최대 | 판단 |
+|---|---|---|---|---|---|
+| 100 | 608 | 1.9s / 5.5s | 10.7s | 734 | 여유 |
+| 300 | 1,470 | 2.0s / 2.2s | 10.5s | 1,330 | 여유 |
+| 1,000 | 1,508 | 6.4s / 7.0s | 10.8s | 7,879 | 여유 |
+| 3,000 | 7,377 | 4.1s / 9.0s | 11.6s | 16,804 | 여유 |
+| 6,000 | 10,033 | 6.0s / 11.1s | 12.2s | 76,416 | 여유 |
+| 10,000 | 12,463 | 7.2s / 7.9s | 14.3s | 64,966 | 여유 |
+| 20,000 | 9,614 | 40.5s / 63.0s | 44.3s | 1,048,636 | **한계** |
 
-| 입력 속도 (목표 / 실측, 건/s) | 처리 속도 (건/s) | 배치 처리 시간 평균 / 최대 | 지연 p95 평균 / 최대 | lag 최대 | lag 추세 | 판단 |
-|---|---|---|---|---|---|---|
-| 100 / 96 | 608 | 1.9s / 5.5s | 10.7s / 12.3s | 734 | 일정 | 여유 |
-| 300 / 287 | 1,470 | 2.0s / 2.2s | 10.5s / 10.6s | 1,330 | 일정 | 여유 |
-| 1,000 / 862 | 1,508 | 6.4s / 7.0s | 10.8s / 10.9s | 7,879 | 일정 | 여유 |
-| 3,000 / 3,083 | 7,377 | 4.1s / 9.0s | 11.6s / 11.8s | 16,804 | 일정 | 여유 |
-| 6,000 / 5,567 | 10,033 | 6.0s / 11.1s | 12.2s / 14.7s | 76,416 | 일정 | 여유 |
-| 10,000 / 10,410 | 12,463 | 7.2s / 7.9s | 14.3s / 15.1s | 64,966 | 일정 | 여유 (배치 7.8s < 트리거 10s) |
-| 20,000 / 11,168 | 9,614 | 40.5s / 63.0s | 44.3s / 75.9s | 1,048,636 | 계속 증가 | **한계** |
+- 지연 p95 바닥 10초 = 트리거 간격
+- 처리 상한 약 13,000건/s. 20,000/s 에서 배치가 10초를 넘겨 lag 가 계속 쌓임
+- **병목**: PostgreSQL 저장 47%, Spark 파싱 46%, Parquet 6%
 
-- 지연 p95 가 낮은 속도에서도 ~10.7초인 이유: 트리거 간격이 10초라 메시지가 평균 5초, 최대 10초를 Kafka 에서 기다린 뒤 처리된다. 지연의 바닥 = 트리거 간격.
-- 10,000/s 까지는 배치가 트리거 간격 안에 끝나 lag 가 쌓이지 않는다. 20,000/s 에서 배치가 40 → 55 → 63초로 늘어나며 lag 가 100만 건까지 쌓였다 (실측 입력 11,168/s 는 그 단계에서 실제로 처리된 평균 속도). 생성기를 멈춘 뒤 밀린 100만 건을 63초 배치 하나로 따라잡았다.
-- **처리 상한은 약 12,000 ~ 14,000 건/s.** 1,000/s 단계의 배치가 3,000/s 보다 느린 것은 그 구간에서 보관 기간 밖 행 삭제(`DELETE_OLD`)가 많이 돌아서다 — 삭제가 같은 트랜잭션에 있어 배치 시간에 포함된다.
+### 7-3. 장애
 
-**어디가 먼저 막혔나** — 10,000/s 로 600,000건을 보내며 구간별 시간을 재면 Spark(파싱 · 검증 · 중복 제거) 46%, PostgreSQL 저장 47%, Parquet 6% 다. PostgreSQL 구간은 배치마다 staging 통째로 쓰기 → 업서트 → 1분 집계 재계산 → 보관 기간 삭제를 한 트랜잭션에서 하므로 건수가 적어도 2.4초 이상 걸리는 고정 비용이 있고, 건수가 늘면 Spark 쪽과 같이 늘어난다. **한 줄: PostgreSQL 저장(집계 재계산 포함)과 Spark 파싱이 반반으로 상한을 만들고, 그 상한(~13,000/s)을 넘는 20,000/s 에서 lag 가 쌓인다.**
+| 장애 | 대응 |
+|---|---|
+| DB 정지 | 5s → 10s → 20s → 30s 간격으로 최대 6번 재시도. `ON CONFLICT` 라 중복 없음 |
+| Spark 죽음 | 체크포인트에서 이어서 처리 |
+| 깨진 메시지 | DLQ 토픽으로 격리 |
+| 입력 폭증 | `--max-offsets-per-trigger` 로 배치 크기 제한 |
+| 알림 | 재시도 WARNING, 최종 실패 ERROR 로그. 일 배치는 Discord 웹훅 |
 
-### 7-3. 장애 시나리오와 대응 (fallback · alert)
-
-| 장애 | 대응 방법 | 코드 |
-|---|---|---|
-| DB 가 잠깐 멈춤 | 저장 실패 시 5s → 10s → 20s → 30s 간격으로 최대 6번 재시도. staging 은 매번 통째로 다시 쓰고 `events` 는 `ON CONFLICT` 라 몇 번 다시 해도 결과가 같다 | `preprocess.py` `load_to_postgres` |
-| Spark 가 죽음 | 체크포인트에서 이어서 처리. 죽을 때 처리 중이던 배치는 처음부터 다시 → `ON CONFLICT` 로 중복 없음 | `checkpointLocation` |
-| 깨진 메시지 | 정상 처리는 계속하고, 깨진 건만 이유를 붙여 DLQ 토픽으로 (5장) | `parse_and_validate` |
-| 입력 폭증 | `--max-offsets-per-trigger` 로 배치 하나의 크기를 제한해 한 번에 터지지 않게 | `preprocess.py` 옵션 |
-| 알림 | 재시도마다 `WARNING`, 재시도를 다 쓰면 `ERROR` 로그 후 종료. 일 배치(Airflow)는 `on_failure_callback` → Discord 웹훅 (6장) | `log.warning` / `notify_fail` |
-
-**시나리오 1 — PostgreSQL 60초 정지** (1,000/s 로 150,000건 전송 중)
+**DB 60초 정지** (1,000/s, 150,000건)
 
 ```
-11:00:46  생성기 시작 (1,000/s)
-11:01:16  docker compose stop postgres
-11:01:16  WARNING pg 실패 1/6, 5s 뒤 재시도: connection already closed
-11:01:21  WARNING pg 실패 2/6, 10s 뒤 재시도
-11:01:31  WARNING pg 실패 3/6, 20s 뒤 재시도
-11:01:51  WARNING pg 실패 4/6, 30s 뒤 재시도
-11:02:18  docker compose start postgres
-11:02:26  5번째 시도 성공 — 멈춘 동안 들고 있던 배치(9,998건) 저장. 배치 시간 76.7s, 지연 p95 81.4s
-11:02:35  밀린 77,061건을 배치 하나(8.7s)로 처리
-11:02:42  지연 p95 10.5s 로 복귀  → 회복 시간: DB 복구 후 약 25초
+11:01:16  stop postgres → 재시도 4번 (5s, 10s, 20s, 30s)
+11:02:18  start postgres
+11:02:26  저장 성공, 밀린 77,061건 8.7s 에 처리
+11:02:42  지연 p95 10.5s 복귀
 ```
 
-결과: 보낸 150,000건 중 CSV 자체 중복(같은 행) 30건을 뺀 **149,970건이 전부 PostgreSQL 에 있음** (`inserted` 합 149,970 = `events` 행 수 149,970). 유실 0, 중복 0.
+결과: 149,970건 저장 (CSV 중복 30건 제외). 유실 0, 중복 0.
 
-**시나리오 2 — Spark 강제 종료 → 15초 뒤 재시작** (1,000/s 로 120,000건 전송 중)
+**Spark 강제 종료 → 15초 뒤 재시작** (1,000/s, 120,000건)
 
 ```
-11:04:43  preprocess.py 강제 종료 (taskkill)
-11:04:58  재시작 → 11:05:07 체크포인트에서 이어서 시작
-11:05:19  첫 배치 (9,998건)  지연 p95 43.5s
-11:05:24  밀린 39,501건을 배치 하나(4.5s)로 처리
-11:05:27  지연 p95 6.0s 로 복귀  → 회복 시간: 재시작 후 약 20초
+11:04:43  kill
+11:05:07  재시작, 밀린 39,501건 4.5s 에 처리
+11:05:27  지연 p95 6.0s 복귀
 ```
 
-결과: 120,000건 중 CSV 중복 13건을 뺀 **119,987건 전부 저장**, 유실 0, 중복 0.
+결과: 119,987건 저장 (CSV 중복 13건 제외). 유실 0, 중복 0.
