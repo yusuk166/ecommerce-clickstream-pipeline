@@ -1,11 +1,4 @@
--- PostgreSQL 스키마 (postgres 컨테이너 첫 기동 시 자동 실행)
--- 스트리밍(preprocess.py): events(정제 이벤트), item_stats_1m(1분 집계)
--- 일 배치(dags/dag.py): item_stats_daily(하루 상품 집계), daily_summary(대시보드)
 
--- ----------------------------------------------------------------------
--- 정제된 이벤트 원장. 1행 = Kafka 메시지 1건
--- PK = event_id → 같은 이벤트가 두 번 와도 행이 두 개 생기지 않는다 (멱등 저장)
--- ----------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS events (
     event_id        UUID         PRIMARY KEY,          -- 생성기가 행 내용(timestamp|visitorid|event|itemid)으로 만든 uuid5
     event_type      TEXT         NOT NULL CHECK (event_type IN ('view', 'addtocart', 'transaction')),
@@ -16,10 +9,13 @@ CREATE TABLE IF NOT EXISTS events (
     transaction_id  BIGINT,                            -- transaction 일 때만 값이 있음
     schema_version  INT          NOT NULL,
     source          TEXT         NOT NULL,
-    ingested_at     TIMESTAMPTZ  NOT NULL DEFAULT now() -- 이 테이블에 들어온 시각
+    ingested_at     TIMESTAMPTZ  NOT NULL DEFAULT now() 
 );
+
+CREATE INDEX IF NOT EXISTS idx_events_time ON events (event_time);
 CREATE INDEX IF NOT EXISTS idx_events_visitor_time ON events (visitor_id, event_time);
 CREATE INDEX IF NOT EXISTS idx_events_item_time    ON events (item_id, event_time);
+
 
 -- Spark 가 micro-batch 를 JDBC 로 통째로 밀어 넣는 임시 테이블.
 -- 배치마다 overwrite 되고, 여기서 events 로 ON CONFLICT 로 옮긴다.
